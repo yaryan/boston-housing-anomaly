@@ -1,0 +1,250 @@
+"""
+Day 5: Train models and evaluate.
+
+Pipeline:
+1. PER-CITY time-aware split: take the most recent ~15% of each city's
+   sales as that city's test set, the rest as training. This ensures
+   every city is represented in the test set.
+2. Three models, each predicting log(LS_PRICE):
+   - Mean predictor (baseline floor)
+   - Linear regression (classical baseline)
+   - LightGBM (the real model)
+3. Compare all three plus the assessor's TOTAL_VAL benchmark
+4. Report metrics: MAE in $, MAPE, R^2 — overall and broken down by city
+5. Save the trained LightGBM model
+
+Run from project root:
+    python scripts/train_model.py
+"""
+
+from pathlib import Path
+
+import joblib
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import OneHotEncoder
+
+INPUT = Path("data/processed/features.parquet")
+MODEL_DIR = Path("models")
+MODEL_DIR.mkdir(exist_ok=True)
+MODEL_PATH = MODEL_DIR / "lgb_model.pkl"
+METRICS_PATH = MODEL_DIR / "metrics.json"
+
+# Test fraction: take the most recent X% of each city's sales as test
+TEST_FRACTION = 0.15
+
+NUMERIC_FEATURES = [
+    "RES_AREA", "YEAR_BUILT", "UNITS", "NUM_ROOMS", "STORIES",
+    "LS_YEAR", "DIST_TO_T_KM", "NBR_MEDIAN_PSF", "NBR_SAMPLE_SIZE",
+    "LATITUDE", "LONGITUDE",
+]
+CATEGORICAL_FEATURES = ["CITY_NAME", "USE_CODE_NUM", "STYLE", "ZIP"]
+TARGET_COL = "LS_PRICE"
+
+LGB_PARAMS = dict(
+    objective="regression",
+    metric="mae",
+    learning_rate=0.05,
+    num_leaves=63,
+    feature_fraction=0.85,
+    bagging_fraction=0.85,
+    bagging_freq=5,
+    min_data_in_leaf=50,
+    n_estimators=2000,
+    verbose=-1,
+)
+
+
+def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in NUMERIC_FEATURES:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in CATEGORICAL_FEATURES:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+    return df
+
+
+def per_city_time_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Within each city, take the most recent TEST_FRACTION as test.
+
+    Each city has a different data vintage (Boston ends ~2022, Cambridge
+    goes to 2025). A single global threshold leaves Boston out of the
+    test set entirely. Per-city splits give every city test coverage.
+    """
+    train_parts, test_parts = [], []
+    print("\nPer-city time-aware split:")
+    print(f"  {'City':<12s} {'N':>6s}  {'Train years':>16s}  {'Test years':>14s}  {'Train':>7s}  {'Test':>5s}")
+
+    for city in df["CITY_NAME"].unique():
+        city_df = df[df["CITY_NAME"] == city].sort_values("LS_YEAR")
+        n = len(city_df)
+        n_test = max(int(n * TEST_FRACTION), 50)
+        train_df = city_df.iloc[:-n_test]
+        test_df = city_df.iloc[-n_test:]
+        train_parts.append(train_df)
+        test_parts.append(test_df)
+
+        print(f"  {city:<12s} {n:>6,}  "
+              f"{train_df['LS_YEAR'].min():.0f}-{train_df['LS_YEAR'].max():.0f}".ljust(35) +
+              f"  {test_df['LS_YEAR'].min():.0f}-{test_df['LS_YEAR'].max():.0f}".ljust(16) +
+              f"  {len(train_df):>6,}  {len(test_df):>5,}")
+
+    train = pd.concat(train_parts).reset_index(drop=True)
+    test = pd.concat(test_parts).reset_index(drop=True)
+    return train, test
+
+
+def metrics(y_true: np.ndarray, y_pred: np.ndarray, label: str) -> dict:
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+    print(f"  {label:35s} MAE: ${mae:>9,.0f}  MAPE: {mape:5.1f}%  RMSE: ${rmse:>10,.0f}  R^2: {r2:.3f}")
+    return {"label": label, "mae": float(mae), "mape": float(mape), "rmse": float(rmse), "r2": float(r2)}
+
+
+def baseline_mean(y_train: np.ndarray, y_test: np.ndarray) -> dict:
+    y_pred = np.full_like(y_test, np.exp(np.mean(np.log(y_train))), dtype=float)
+    return metrics(y_test, y_pred, "Baseline: mean predictor")
+
+
+def baseline_linear(train: pd.DataFrame, test: pd.DataFrame) -> tuple[dict, np.ndarray]:
+    feature_cols = [c for c in NUMERIC_FEATURES if c in train.columns]
+    cat_cols = [c for c in CATEGORICAL_FEATURES if c in train.columns]
+
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=20)
+    medians = train[feature_cols].median()
+
+    X_train_num = train[feature_cols].fillna(medians).to_numpy()
+    X_test_num = test[feature_cols].fillna(medians).to_numpy()
+    X_train_cat = ohe.fit_transform(train[cat_cols].astype(str).fillna("missing"))
+    X_test_cat = ohe.transform(test[cat_cols].astype(str).fillna("missing"))
+
+    X_train = np.hstack([X_train_num, X_train_cat])
+    X_test = np.hstack([X_test_num, X_test_cat])
+    y_train = np.log(train[TARGET_COL].to_numpy())
+
+    model = Ridge(alpha=1.0)
+    model.fit(X_train, y_train)
+    y_pred = np.exp(model.predict(X_test))
+    return metrics(test[TARGET_COL].to_numpy(), y_pred, "Linear regression"), y_pred
+
+
+def baseline_assessor(test: pd.DataFrame) -> dict:
+    mask = test["TOTAL_VAL"].notna() & (test["TOTAL_VAL"] > 0)
+    y_true = test.loc[mask, TARGET_COL].to_numpy()
+    y_pred = test.loc[mask, "TOTAL_VAL"].to_numpy().astype(float)
+    return metrics(y_true, y_pred, f"City assessor (TOTAL_VAL, n={mask.sum()})")
+
+
+def train_lgb(train: pd.DataFrame, test: pd.DataFrame) -> tuple[dict, np.ndarray, lgb.LGBMRegressor]:
+    feature_cols = [c for c in NUMERIC_FEATURES + CATEGORICAL_FEATURES if c in train.columns]
+    X_train = train[feature_cols]
+    X_test = test[feature_cols]
+    y_train = np.log(train[TARGET_COL].to_numpy())
+    y_test_actual = test[TARGET_COL].to_numpy()
+
+    val_size = int(len(train) * 0.15)
+    val_idx = np.random.RandomState(42).choice(len(train), size=val_size, replace=False)
+    val_mask = np.zeros(len(train), dtype=bool)
+    val_mask[val_idx] = True
+
+    X_tr, X_val = X_train[~val_mask], X_train[val_mask]
+    y_tr, y_val = y_train[~val_mask], y_train[val_mask]
+
+    print("\nTraining LightGBM...")
+    model = lgb.LGBMRegressor(**LGB_PARAMS)
+    model.fit(
+        X_tr, y_tr,
+        eval_set=[(X_val, y_val)],
+        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+        categorical_feature=[c for c in CATEGORICAL_FEATURES if c in feature_cols],
+    )
+    print(f"  Best iteration: {model.best_iteration_}")
+
+    y_pred = np.exp(model.predict(X_test))
+    return metrics(y_test_actual, y_pred, "LightGBM"), y_pred, model
+
+
+def per_city_breakdown(test: pd.DataFrame, y_pred_lgb: np.ndarray, model_name: str = "LightGBM") -> None:
+    print(f"\nPer-city {model_name} performance (test set):")
+    print(f"  {'City':<12s} {'N':>6s}  {'MAE':>11s}  {'MAPE':>6s}  {'R^2':>6s}")
+    for city in test["CITY_NAME"].unique():
+        mask = test["CITY_NAME"].to_numpy() == city
+        if mask.sum() < 10:
+            continue
+        y_true = test.loc[mask, TARGET_COL].to_numpy()
+        y_p = y_pred_lgb[mask]
+        mae = mean_absolute_error(y_true, y_p)
+        mape = np.mean(np.abs((y_true - y_p) / y_true)) * 100
+        r2 = r2_score(y_true, y_p) if mask.sum() >= 2 else float("nan")
+        print(f"  {city:<12s} {mask.sum():>6,}  ${mae:>9,.0f}  {mape:>5.1f}%  {r2:>5.3f}")
+
+
+def per_city_assessor(test: pd.DataFrame) -> None:
+    print("\nPer-city assessor (TOTAL_VAL) performance for comparison:")
+    print(f"  {'City':<12s} {'N':>6s}  {'MAE':>11s}  {'MAPE':>6s}  {'R^2':>6s}")
+    for city in test["CITY_NAME"].unique():
+        mask = (test["CITY_NAME"].to_numpy() == city) & test["TOTAL_VAL"].notna() & (test["TOTAL_VAL"] > 0)
+        if mask.sum() < 10:
+            continue
+        y_true = test.loc[mask, TARGET_COL].to_numpy()
+        y_p = test.loc[mask, "TOTAL_VAL"].to_numpy().astype(float)
+        mae = mean_absolute_error(y_true, y_p)
+        mape = np.mean(np.abs((y_true - y_p) / y_true)) * 100
+        r2 = r2_score(y_true, y_p) if mask.sum() >= 2 else float("nan")
+        print(f"  {city:<12s} {mask.sum():>6,}  ${mae:>9,.0f}  {mape:>5.1f}%  {r2:>5.3f}")
+
+
+def main() -> None:
+    print(f"Loading {INPUT}...")
+    df = pd.read_parquet(INPUT)
+    print(f"  Rows: {len(df):,}")
+
+    print("\nPreparing features...")
+    df = prepare_features(df)
+
+    train, test = per_city_time_split(df)
+    print(f"\nTotal train: {len(train):,}, total test: {len(test):,}")
+
+    print("\nEvaluation (lower MAE/MAPE = better, higher R^2 = better)")
+    print("-" * 100)
+
+    y_train_arr = train[TARGET_COL].to_numpy()
+    y_test_arr = test[TARGET_COL].to_numpy()
+
+    all_metrics = []
+    all_metrics.append(baseline_mean(y_train_arr, y_test_arr))
+    all_metrics.append(baseline_assessor(test))
+    lin_m, _ = baseline_linear(train, test)
+    all_metrics.append(lin_m)
+    lgb_m, y_pred_lgb, model = train_lgb(train, test)
+    all_metrics.append(lgb_m)
+
+    per_city_breakdown(test, y_pred_lgb)
+    per_city_assessor(test)
+
+    print("\nFeature importance (top 10):")
+    importance = pd.DataFrame({
+        "feature": model.feature_name_,
+        "importance": model.feature_importances_,
+    }).sort_values("importance", ascending=False).head(10)
+    print(importance.to_string(index=False))
+
+    print(f"\nSaving model to {MODEL_PATH}...")
+    joblib.dump(model, MODEL_PATH)
+
+    import json
+    with open(METRICS_PATH, "w") as f:
+        json.dump(all_metrics, f, indent=2)
+    print(f"Saved metrics to {METRICS_PATH}")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

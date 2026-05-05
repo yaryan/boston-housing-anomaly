@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# Data — never commit raw scraped data or large processed files
+data/raw/*
+data/processed/*
+data/external/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/external/.gitkeep
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.csv
+!data/sample/*.csv
+
+# Models
+*.pkl
+*.joblib
+models/saved/
+
+# Notebooks
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.local
+*.key
+
+# GTFS / large transit data
+MBTA_GTFS/
+
+# Logs
+*.log
+logs/
+
+# Streamlit
+.streamlit/secrets.toml
