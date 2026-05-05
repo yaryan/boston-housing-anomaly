@@ -1,14 +1,11 @@
 """
-Day 2: Load all 4 cities into one clean table.
+Day 8 (revised): tighter quality filter using price-per-sqft floor.
 
-Steps:
-1. Read each city's assessor .dbf file (auto-detecting the year suffix)
-2. Add CITY_NAME and FY_YEAR columns
-3. Stack them all together
-4. Harmonize USE_CODE across fiscal years (FY23 uses 0101, FY25/26 uses 1010)
-5. Filter to residential only
-6. Filter out obviously bad rows (zero price, zero area, very old sales)
-7. Save the clean result as Parquet in data/processed/
+Key change vs. previous version:
+- Added MIN_PRICE_PER_SQFT filter to catch sub-market sales that survived
+  the absolute $50K floor (family transfers at $200K, nominal deeds, etc.).
+- Boston-area market floor is well above $150/sqft for any real arms-length
+  sale, so this is conservative and catches data artifacts not real prices.
 
 Run from project root:
     python scripts/build_clean_dataset.py
@@ -19,7 +16,6 @@ from pathlib import Path
 import pandas as pd
 from dbfread import DBF
 
-# Paths to each city's extracted folder
 CITY_DIRS = {
     "Boston":     Path("data/raw/assessor/L3_SHP_M035_Boston"),
     "Cambridge":  Path("data/raw/assessor/L3_SHP_M049_Cambridge"),
@@ -27,11 +23,19 @@ CITY_DIRS = {
     "Brookline":  Path("data/raw/assessor/L3_SHP_M046_Brookline"),
 }
 
-# Each city has a TOWN_ID embedded in filenames: M035, M049, M274, M046
 TOWN_IDS = {"Boston": "035", "Cambridge": "049", "Somerville": "274", "Brookline": "046"}
 
 OUTPUT_PATH = Path("data/processed/clean_assessor.parquet")
 OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Quality filter thresholds
+MIN_PRICE = 150_000           # absolute floor (was 50K — way too lax)
+MAX_PRICE = 10_000_000
+MIN_PRICE_PER_SQFT = 150      # Greater Boston market floor; below = artifact
+MAX_PRICE_PER_SQFT = 3_500    # above this is luxury or data error
+MIN_YEAR_BUILT = 1700
+MAX_YEAR_BUILT = 2025
+MIN_SALE_YEAR = 2015
 
 
 def load_city(city: str, folder: Path) -> pd.DataFrame:
@@ -41,12 +45,10 @@ def load_city(city: str, folder: Path) -> pd.DataFrame:
     fiscal year (e.g., Boston is CY22_FY23, Cambridge is CY25_FY26).
     """
     town_id = TOWN_IDS[city]
-
     print(f"\nLoading {city}...")
 
     assess_matches = list(folder.glob(f"M{town_id}Assess_*.dbf"))
     uc_lut_matches = list(folder.glob(f"M{town_id}UC_LUT_*.dbf"))
-
     if not assess_matches:
         raise FileNotFoundError(f"No assessor file found in {folder}")
     if not uc_lut_matches:
@@ -54,7 +56,6 @@ def load_city(city: str, folder: Path) -> pd.DataFrame:
 
     assess_path = assess_matches[0]
     uc_lut_path = uc_lut_matches[0]
-
     print(f"  Using: {assess_path.name}")
 
     # Main assessor table
@@ -72,7 +73,6 @@ def load_city(city: str, folder: Path) -> pd.DataFrame:
     # Extract the fiscal year from the filename (e.g., "FY23" -> 2023)
     fy_str = assess_path.stem.split("FY")[-1][:2]
     df["FY_YEAR"] = 2000 + int(fy_str)
-
     return df
 
 
@@ -94,7 +94,6 @@ def harmonize_use_code(df: pd.DataFrame) -> pd.DataFrame:
     # it's the new format — divide by 10 to get the canonical 3-digit code.
     new_format = (df["USE_CODE_NUM"] >= 1000) & (df["USE_CODE_NUM"] % 10 == 0)
     df.loc[new_format, "USE_CODE_NUM"] = df.loc[new_format, "USE_CODE_NUM"] // 10
-
     return df
 
 
@@ -105,7 +104,7 @@ def filter_residential(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_quality(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop rows with obviously placeholder or unusable values."""
+    """Drop rows that look like data artifacts rather than real sales."""
     n0 = len(df)
     df = df.copy()
 
@@ -114,16 +113,29 @@ def filter_quality(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Sale date is YYYYMMDD as int — convert to year for filtering
     df["LS_YEAR"] = pd.to_numeric(df["LS_DATE"].astype(str).str[:4], errors="coerce")
 
-    df = df[df["LS_PRICE"] >= 50_000]      # arms-length sale, not gift/transfer
-    df = df[df["LS_PRICE"] <= 10_000_000]  # filter outliers
-    df = df[df["RES_AREA"] > 0]            # has real building area
-    df = df[df["YEAR_BUILT"].between(1700, 2025)]  # real year, not "1900" sentinel
-    df = df[df["LS_YEAR"] >= 2015]         # recent sales only
+    # Sequential filters with logging so we can see where rows are dropped
+    n = len(df); df = df[df["LS_PRICE"].between(MIN_PRICE, MAX_PRICE)]
+    print(f"  Price in [${MIN_PRICE:,}, ${MAX_PRICE:,}]: -{n - len(df):,}")
 
-    print(f"  After quality filter: {len(df):,} (dropped {n0 - len(df):,})")
+    n = len(df); df = df[df["RES_AREA"] > 0]
+    print(f"  RES_AREA > 0: -{n - len(df):,}")
+
+    n = len(df); df = df[df["YEAR_BUILT"].between(MIN_YEAR_BUILT, MAX_YEAR_BUILT)]
+    print(f"  YEAR_BUILT in [{MIN_YEAR_BUILT}, {MAX_YEAR_BUILT}]: -{n - len(df):,}")
+
+    n = len(df); df = df[df["LS_YEAR"] >= MIN_SALE_YEAR]
+    print(f"  LS_YEAR >= {MIN_SALE_YEAR}: -{n - len(df):,}")
+
+    # NEW: price-per-sqft floor catches sub-market sales the absolute floor missed
+    df["_PSF"] = df["LS_PRICE"] / df["RES_AREA"]
+    n = len(df); df = df[df["_PSF"].between(MIN_PRICE_PER_SQFT, MAX_PRICE_PER_SQFT)]
+    print(f"  $/sqft in [${MIN_PRICE_PER_SQFT}, ${MAX_PRICE_PER_SQFT}]: -{n - len(df):,}")
+    df = df.drop(columns=["_PSF"])
+
+    print(f"\n  Total dropped: {n0 - len(df):,} ({(n0 - len(df))/n0:.1%})")
+    print(f"  Kept: {len(df):,}")
     return df
 
 
@@ -132,25 +144,22 @@ def main() -> None:
     combined = pd.concat(frames, ignore_index=True)
     print(f"\nCombined raw rows: {len(combined):,}")
 
-    print("\nHarmonizing use codes across fiscal years...")
+    print("\nHarmonizing use codes...")
     combined = harmonize_use_code(combined)
 
-    print("\nFiltering to residential properties...")
+    print("\nFiltering to residential...")
     residential = filter_residential(combined)
     print(f"Residential rows: {len(residential):,}")
 
-    print("\nApplying quality filters...")
+    print("\nApplying quality filters:")
     clean = filter_quality(residential)
 
-    print(f"\nFinal clean dataset: {len(clean):,} rows × {len(clean.columns)} columns")
+    print(f"\nFinal: {len(clean):,} rows × {len(clean.columns)} columns")
     print("\nRows per city:")
     print(clean["CITY_NAME"].value_counts().to_string())
 
-    print("\nFiscal year per city:")
-    print(clean.groupby("CITY_NAME")["FY_YEAR"].first().to_string())
-
-    print("\nProperty type distribution (top 10):")
-    print(clean["USE_CODE_NUM"].astype(int).value_counts().head(10).to_string())
+    print("\nProperty type distribution (top 8):")
+    print(clean["USE_CODE_NUM"].astype(int).value_counts().head(8).to_string())
 
     print(f"\nSaving to {OUTPUT_PATH}...")
     clean.to_parquet(OUTPUT_PATH, index=False)
